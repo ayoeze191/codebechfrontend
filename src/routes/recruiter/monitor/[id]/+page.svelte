@@ -38,7 +38,7 @@
     assessmentId: string;
   }
 
-  let assessmentId = $state("");
+  let assessmentId = $state(page.params._assessmentId);
 
   let candidates = $state<Candidate[]>([]);
   let selectedCandidate = $state<Candidate | null>(null);
@@ -63,21 +63,23 @@
 
     if (!selectedCandidate) return;
 
-    const response = await api.get<CandidateEvent[]>(`/candidates/${candidateId}/events`);
+    const response = await api.get<CandidateEvent[]>(
+      `/candidates/${candidateId}/events`,
+    );
 
     candidateEvents = response;
   }
 
   onMount(async () => {
-    assessmentId = page.params.id ?? "";
-
     await socketStore.connect();
 
     socketStore.emit("recruiter:join", {
       assessmentId,
     });
 
-    const response = await api.get<Candidate[]>(`/assessments/${assessmentId}/candidates`);
+    const response = await api.get<Candidate[]>(
+      `/assessments/${assessmentId}/candidates`,
+    );
 
     candidates = response.map((candidate: Candidate) => ({
       ...candidate,

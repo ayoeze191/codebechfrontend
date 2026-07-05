@@ -365,7 +365,7 @@
           size="sm"
           onclick={() => {
             const selected = candidates.filter((c) =>
-              selectedCandidates.includes(c.id),
+              selectedCandidates.includes(c.invitationId),
             );
             inviteEmails = selected.map((c) => c.email).join("\n");
             showInviteModal = true;

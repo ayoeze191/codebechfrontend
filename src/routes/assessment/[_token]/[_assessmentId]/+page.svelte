@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { api } from "$lib/api";
   import { socketStore } from "$stores/socketStore";
   import { fade, slide, scale } from "svelte/transition";
@@ -86,6 +86,40 @@
         )
       : [],
   );
+  function reportEvent(type: string, extra: Record<string, unknown> = {}) {
+    // Fire-and-forget over the socket — a dropped event shouldn't interrupt
+    // the candidate's assessment.
+    socketStore.emit("candidate:event", { type, ...extra });
+  }
+
+  function handleVisibilityChange() {
+    reportEvent("visibilitychange", { hidden: document.hidden });
+  }
+
+  function handleWindowBlur() {
+    reportEvent("blur");
+  }
+
+  function handleWindowFocus() {
+    reportEvent("focus");
+  }
+
+  function handleCopy() {
+    reportEvent("copy");
+  }
+
+  function handlePaste(e: ClipboardEvent) {
+    const pastedLength = e.clipboardData?.getData("text")?.length ?? 0;
+    reportEvent("paste", { pastedLength });
+  }
+
+  function handleFullscreenExit() {
+    // Only relevant if you're actually putting candidates into fullscreen
+    // mode somewhere — fires when they exit it.
+    if (!document.fullscreenElement) {
+      reportEvent("fullscreen_exit");
+    }
+  }
 
   async function loadAssessment() {
     error = "";
@@ -103,7 +137,7 @@
       selectedQuestionId = assessment.questions[0]?.id ?? "";
 
       await socketStore.connect();
-      socketStore.emit("candidate:join", { invitationToken: assessmentToken });
+      socketStore.emit("candidate:join");
 
       await loadSubmissions();
 
@@ -128,6 +162,24 @@
 
   onMount(async () => {
     await loadAssessment();
+    await socketStore.connect();
+    socketStore.emit("candidate:join");
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("copy", handleCopy);
+    document.addEventListener("paste", handlePaste);
+    document.addEventListener("fullscreenchange", handleFullscreenExit);
+  });
+
+  onDestroy(() => {
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
+    window.removeEventListener("blur", handleWindowBlur);
+    window.removeEventListener("focus", handleWindowFocus);
+    document.removeEventListener("copy", handleCopy);
+    document.removeEventListener("paste", handlePaste);
+    document.removeEventListener("fullscreenchange", handleFullscreenExit);
   });
 
   // Submits the current question's code as the candidate's final answer
