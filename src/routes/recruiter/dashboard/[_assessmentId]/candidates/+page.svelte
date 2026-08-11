@@ -28,14 +28,12 @@
     totalFailed: number;
   };
 
-  let assessmentId = $state("");
-  $effect(() => {
-    assessmentId = page.params!._assessmentId!; // confirm this matches your route folder param name
-  });
+  const assessmentId = $derived(page.params._assessmentId!);
 
   let candidates = $state<Candidate[]>([]);
   let isLoading = $state(true);
   let error = $state("");
+  let notice = $state("");
   let searchQuery = $state("");
   let selectedCandidates = $state<string[]>([]);
   let showInviteModal = $state(false);
@@ -122,9 +120,30 @@
         .map((email) => email.trim())
         .filter((email) => email && email.includes("@"));
 
-      await api.post(`/assessments/${assessmentId}/invitations`, {
-        emails: emailList,
-      });
+      const response = await api.post<{
+        results: Array<{ email: string; status: string }>;
+      }>(`/invitations/${assessmentId}/invitations`, { emails: emailList });
+
+      // The backend processes each address independently, so report what
+      // actually happened rather than assuming every one went out.
+      const tally = response.results.reduce<Record<string, number>>(
+        (counts, result) => {
+          counts[result.status] = (counts[result.status] ?? 0) + 1;
+          return counts;
+        },
+        {},
+      );
+      const labels: Record<string, string> = {
+        sent: "sent",
+        already_invited: "already invited",
+        duplicate: "duplicates skipped",
+        invalid_email: "invalid",
+        created_but_not_emailed: "created but the email failed",
+      };
+      notice = Object.entries(tally)
+        .map(([status, count]) => `${count} ${labels[status] ?? status}`)
+        .join(", ");
+
       await loadCandidates();
       showInviteModal = false;
       inviteEmails = "";
@@ -139,7 +158,7 @@
   async function resendInvite(invitationId: string) {
     error = "";
     try {
-      await api.post(`/assessments/invitations/${invitationId}/resend`, {});
+      await api.post(`/invitations/${invitationId}/resend`, {});
       await loadCandidates();
     } catch (err) {
       error =
@@ -164,12 +183,24 @@
   }
 </script>
 
-<main class="min-h-screen p-6 bg-gradient-to-br from-slate-50 to-slate-100/80">
+<svelte:head><title>Candidates · CodeBench</title></svelte:head>
+
+<div>
   {#if error}
     <div
       class="bg-red-50 text-red-600 rounded-lg px-4 py-3 mb-6 border border-red-200"
+      role="alert"
     >
       {error}
+    </div>
+  {/if}
+
+  {#if notice}
+    <div
+      class="bg-emerald-50 text-emerald-800 rounded-lg px-4 py-3 mb-6 border border-emerald-200 flex items-center justify-between gap-4"
+    >
+      <span>Invitations processed: {notice}</span>
+      <button class="text-emerald-700" onclick={() => (notice = "")}>✕</button>
     </div>
   {/if}
 
@@ -324,7 +355,7 @@
                           variant="outline"
                           onclick={() =>
                             goto(
-                              `/recruiter/candidates/${candidate.invitationId}/results`,
+                              `/recruiter/dashboard/${assessmentId}/results?candidate=${encodeURIComponent(candidate.email)}`,
                             )}
                         >
                           <span class="mr-1">📊</span> View
@@ -425,9 +456,7 @@
         </div>
 
         <Dialog.Footer>
-          <Dialog.Close asChild>
-            <Button type="button" variant="outline">Cancel</Button>
-          </Dialog.Close>
+          <Button type="button" variant="outline" onclick={() => (showInviteModal = false)}>Cancel</Button>
           <Button type="submit" disabled={isInviting || !inviteEmails.trim()}>
             {isInviting ? "Sending..." : "Send Invitations"}
           </Button>
@@ -456,4 +485,4 @@
       </AlertDialog.Footer>
     </AlertDialog.Content>
   </AlertDialog.Root>
-</main>
+</div>

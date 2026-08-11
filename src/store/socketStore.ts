@@ -19,11 +19,11 @@ function createSocketStore() {
   return {
     subscribe,
 
-    async connect(token = localStorage.getItem("codebench_token")) {
+    async connect(token = localStorage.getItem("codebench_token"), invitationToken?: string) {
       if (socket) return;
 
       socket = io(API_URL, {
-        auth: { token },
+        auth: invitationToken ? { invitationToken } : { token },
         transports: ["websocket"],
         reconnection: true,
         reconnectionAttempts: 5,
@@ -63,13 +63,13 @@ function createSocketStore() {
       }
     },
 
-    on(event: string, callback: (...args: unknown[]) => void) {
+    on(event: string, callback: (...args: any[]) => void) {
       if (socket) {
         socket.on(event, callback);
       }
     },
 
-    off(event: string, callback?: (...args: unknown[]) => void) {
+    off(event: string, callback?: (...args: any[]) => void) {
       if (socket) {
         if (callback) {
           socket.off(event, callback);

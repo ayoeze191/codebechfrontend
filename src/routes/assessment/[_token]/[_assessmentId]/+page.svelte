@@ -4,6 +4,8 @@
   import { socketStore } from "$stores/socketStore";
   import { fade, slide, scale } from "svelte/transition";
   import { page } from "$app/state";
+  import { loadLanguages, defaultLanguage, type Language } from "$lib/languages";
+  import MonacoEditor from "$components/MonacoEditor.svelte";
 
   type TestCase = {
     id: string;
@@ -37,31 +39,42 @@
     createdAt: string;
   };
 
-  const defaultValue =
-    "module.exports = function(a, b) { \n return a + b;\n };";
+  type RunResult = {
+    passed: boolean;
+    output?: unknown;
+    expected?: unknown;
+    stdout?: string;
+    error?: string;
+    executionTime?: number;
+  };
 
-  let assessmentToken = $state("");
-  $effect(() => {
-    // NOTE: verify this matches your route folder param name, e.g. if the
-    // folder is src/routes/take/[token]/+page.svelte the key is "token",
-    // not "_token".
-    assessmentToken = page.params!._token!;
-  });
+  const assessmentToken = $derived(page.params._token!);
 
   let assessment = $state<Assessment | null>(null);
+  let startedAt = $state<string | null>(null);
   let selectedQuestionId = $state("");
-  let code = $state(defaultValue);
+  let languages = $state<Language[]>([]);
   let language = $state("javascript");
   let submissions = $state<Submission[]>([]);
   let message = $state("");
   let error = $state("");
-  let loading = $state(false);
-  let loadingQuestion = $state(false);
+  let loading = $state(true);
+  let loadingQuestion = $state(true);
   let isFullscreen = $state(false);
   let isSubmitting = $state(false);
   let isRunning = $state(false);
   let isFinishing = $state(false);
   let hoveredQuestion = $state<string | null>(null);
+
+  // Answers are kept per question *and* per language, so switching either one
+  // never throws away work the candidate has already done.
+  let codeByKey = $state<Record<string, string>>({});
+  let runResults = $state<RunResult[]>([]);
+  let runError = $state("");
+
+  let submissionRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let clockTimer: ReturnType<typeof setInterval> | undefined;
+  let now = $state(Date.now());
 
   // Finish flow
   let showFinishConfirm = $state(false);
@@ -73,19 +86,53 @@
   } | null>(null);
 
   const selectedQuestion = $derived(
-    assessment?.questions.find(
-      (question) => question.id === selectedQuestionId,
-    ) ?? null,
+    assessment?.questions.find((question) => question.id === selectedQuestionId) ??
+      null,
   );
 
-  // Questions that don't yet have a submission on record.
+  const currentLanguage = $derived(
+    languages.find((item) => item.id === language) ?? null,
+  );
+
+  const codeKey = $derived(`${selectedQuestionId}::${language}`);
+
+  const code = $derived(
+    codeByKey[codeKey] ?? currentLanguage?.starterCode ?? "",
+  );
+
   const unansweredQuestions = $derived(
     assessment
       ? assessment.questions.filter(
-          (q) => !submissions.some((s) => s.questionId === q.id),
+          (question) => !submissions.some((s) => s.questionId === question.id),
         )
       : [],
   );
+
+  // The clock runs from the moment the candidate opened the assessment, which
+  // the server records the first time GET /take/:token is called.
+  const deadline = $derived(
+    assessment && startedAt
+      ? new Date(startedAt).getTime() + assessment.duration * 60_000
+      : null,
+  );
+
+  const msRemaining = $derived(deadline ? Math.max(0, deadline - now) : null);
+
+  const timeRemaining = $derived(
+    msRemaining === null
+      ? "--:--"
+      : `${String(Math.floor(msRemaining / 60_000)).padStart(2, "0")}:${String(
+          Math.floor((msRemaining % 60_000) / 1000),
+        ).padStart(2, "0")}`,
+  );
+
+  const isOutOfTime = $derived(msRemaining !== null && msRemaining === 0);
+  const isLocked = $derived(isCompleted || isOutOfTime);
+
+  function setCode(value: string) {
+    codeByKey = { ...codeByKey, [codeKey]: value };
+  }
+
   function reportEvent(type: string, extra: Record<string, unknown> = {}) {
     // Fire-and-forget over the socket — a dropped event shouldn't interrupt
     // the candidate's assessment.
@@ -114,8 +161,6 @@
   }
 
   function handleFullscreenExit() {
-    // Only relevant if you're actually putting candidates into fullscreen
-    // mode somewhere — fires when they exit it.
     if (!document.fullscreenElement) {
       reportEvent("fullscreen_exit");
     }
@@ -123,7 +168,6 @@
 
   async function loadAssessment() {
     error = "";
-    message = "";
     loading = true;
     loadingQuestion = true;
 
@@ -131,17 +175,14 @@
       const response = await api.get<{
         assessment: Assessment;
         invitation: { id: string; startedAt: string; expiresAt: string };
-      }>(`/assessments/take/${assessmentToken}`);
+      }>(`/assessments/take/${assessmentToken}`, { auth: false });
 
       assessment = response.assessment;
+      startedAt = response.invitation.startedAt;
       selectedQuestionId = assessment.questions[0]?.id ?? "";
 
-      await socketStore.connect();
-      socketStore.emit("candidate:join");
-
       await loadSubmissions();
-
-      message = "Assessment loaded successfully";
+      message = "Assessment loaded. Good luck!";
     } catch (err) {
       error = err instanceof Error ? err.message : "Failed to load assessment";
     } finally {
@@ -154,6 +195,7 @@
     try {
       submissions = await api.get<Submission[]>(
         `/assessments/take/${assessmentToken}/submissions`,
+        { auth: false },
       );
     } catch (err) {
       console.error("Failed to load submissions:", err);
@@ -161,9 +203,30 @@
   }
 
   onMount(async () => {
+    languages = await loadLanguages();
+    language = defaultLanguage(languages)?.id ?? "javascript";
+
     await loadAssessment();
-    await socketStore.connect();
-    socketStore.emit("candidate:join");
+
+    try {
+      await socketStore.connect(undefined, assessmentToken);
+      socketStore.emit("candidate:join");
+    } catch (err) {
+      console.error("Live monitoring connection failed:", err);
+    }
+
+    // Execution is queued, so poll while anything is still in flight.
+    submissionRefreshTimer = setInterval(() => {
+      if (
+        submissions.some((submission) =>
+          ["PENDING", "RUNNING"].includes(submission.status),
+        )
+      ) {
+        loadSubmissions();
+      }
+    }, 2000);
+
+    clockTimer = setInterval(() => (now = Date.now()), 1000);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("blur", handleWindowBlur);
@@ -174,42 +237,43 @@
   });
 
   onDestroy(() => {
+    if (submissionRefreshTimer) clearInterval(submissionRefreshTimer);
+    if (clockTimer) clearInterval(clockTimer);
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     window.removeEventListener("blur", handleWindowBlur);
     window.removeEventListener("focus", handleWindowFocus);
     document.removeEventListener("copy", handleCopy);
     document.removeEventListener("paste", handlePaste);
     document.removeEventListener("fullscreenchange", handleFullscreenExit);
+    socketStore.disconnect();
   });
 
-  // Submits the current question's code as the candidate's final answer
-  // for that question. Backend treats every /submit call as final and
-  // persists it immediately (there is no separate draft/final distinction
-  // per-question) — so this button IS the "final answer" for this question.
+  // Submits the current question's code as the candidate's answer for that
+  // question. Re-submitting replaces the previous answer.
   async function submitCode() {
-    if (!assessment || !selectedQuestionId) return;
+    if (!assessment || !selectedQuestionId || isLocked) return;
 
     error = "";
     message = "";
+    runError = "";
     isSubmitting = true;
 
     try {
-      const response = await api.post<{
-        id: string;
-        questionId: string;
-        status: string;
-        passed: number;
-        failed: number;
-      }>(`/assessments/take/${assessmentToken}/submit`, {
-        questionId: selectedQuestionId,
-        code,
-        language,
-      });
+      await api.post(
+        `/submissions`,
+        {
+          token: assessmentToken,
+          questionId: selectedQuestionId,
+          code,
+          language,
+          isFinal: true,
+        },
+        { auth: false },
+      );
 
-      message = `✅ Submitted — ${response.passed}/${response.passed + response.failed} tests passed`;
+      message = "✅ Answer submitted — running against all test cases…";
 
       socketStore.emit("candidate:submitted", {
-        invitationToken: assessmentToken,
         questionId: selectedQuestionId,
       });
 
@@ -221,27 +285,39 @@
     }
   }
 
-  // Practice run against visible test cases only. Does not persist a
-  // submission row.
+  // Practice run against the visible test cases only. Nothing is persisted.
   async function runCode() {
-    if (!assessment || !selectedQuestionId) return;
+    if (!assessment || !selectedQuestionId || isLocked) return;
 
     error = "";
     message = "";
+    runError = "";
+    runResults = [];
     isRunning = true;
+
     try {
       const response = await api.post<{
-        results: { results: { id: string; passed: boolean }[] };
-      }>(`/assessments/take/${assessmentToken}/run`, {
-        questionId: selectedQuestionId,
-        code,
-        language,
-      });
+        results: RunResult[];
+        error?: string;
+        summary: { passed: number; failed: number; total: number };
+      }>(
+        `/submissions/test`,
+        {
+          token: assessmentToken,
+          questionId: selectedQuestionId,
+          code,
+          language,
+        },
+        { auth: false },
+      );
 
-      const passedCount = response.results.results.filter(
-        (r) => r.passed,
-      ).length;
-      message = `✅ Passed ${passedCount}/${response.results.results.length} visible test cases`;
+      if (response.error) {
+        runError = response.error;
+        return;
+      }
+
+      runResults = response.results;
+      message = `Passed ${response.summary.passed}/${response.summary.total} visible test cases`;
     } catch (err) {
       error = err instanceof Error ? err.message : "Failed to run code";
     } finally {
@@ -249,9 +325,6 @@
     }
   }
 
-  // Candidate clicks "Finish Assessment" — show a confirmation modal first
-  // so they know how many questions they haven't touched yet, since the
-  // backend finalizes the whole invitation the moment /finish is called.
   function requestFinish() {
     showFinishConfirm = true;
   }
@@ -263,7 +336,7 @@
       const response = await api.post<{
         invitation: { completedAt: string | null };
         unansweredQuestions: number;
-      }>(`/assessments/take/${assessmentToken}/finish`, {});
+      }>(`/assessments/take/${assessmentToken}/finish`, {}, { auth: false });
 
       const totalQuestions = assessment?.questions.length ?? 0;
       completionData = {
@@ -274,8 +347,7 @@
       isCompleted = true;
       showFinishConfirm = false;
     } catch (err) {
-      error =
-        err instanceof Error ? err.message : "Failed to finish assessment";
+      error = err instanceof Error ? err.message : "Failed to finish assessment";
       showFinishConfirm = false;
     } finally {
       isFinishing = false;
@@ -292,9 +364,14 @@
   }
 
   function getQuestionStatus(questionId: string): string {
-    const sub = submissions.find((s) => s.questionId === questionId);
-    if (!sub) return "Not Started";
-    return sub.status;
+    return (
+      submissions.find((submission) => submission.questionId === questionId)
+        ?.status ?? "Not Started"
+    );
+  }
+
+  function preview(value: unknown) {
+    return value === undefined ? "—" : JSON.stringify(value);
   }
 </script>
 
@@ -323,11 +400,21 @@
         </svg>
       </div>
       <div>
-        <h1>CodeWorks</h1>
+        <h1>CodeBench</h1>
         <span class="role-badge">Candidate</span>
       </div>
     </div>
     <div class="nav-actions">
+      {#if deadline}
+        <div
+          class="countdown"
+          class:urgent={msRemaining !== null && msRemaining < 5 * 60_000}
+          class:expired={isOutOfTime}
+        >
+          <span class="countdown-icon">⏱</span>
+          <span class="countdown-value">{timeRemaining}</span>
+        </div>
+      {/if}
       <div class="progress-indicator">
         <span class="progress-text">
           {submissions.length}/{assessment?.questions.length || 0} answered
@@ -335,7 +422,7 @@
         <div class="progress-bar">
           <div
             class="progress-fill"
-            style="width: {assessment
+            style="width: {assessment && assessment.questions.length
               ? (submissions.length / assessment.questions.length) * 100
               : 0}%"
           ></div>
@@ -350,6 +437,16 @@
       </button>
     </div>
   </nav>
+
+  {#if isOutOfTime && !isCompleted}
+    <div class="message-banner error">
+      <span class="banner-icon">⏰</span>
+      <span>
+        Your time is up. Submit the assessment to record the answers you have
+        already sent.
+      </span>
+    </div>
+  {/if}
 
   <!-- Loader Section -->
   {#if loading}
@@ -413,7 +510,7 @@
               <button
                 class="question-item"
                 class:active={selectedQuestionId === question.id}
-                class:completed={getQuestionStatus(question.id) === "PASSED"}
+                class:completed={getQuestionStatus(question.id) === "COMPLETED"}
                 onmouseenter={() => (hoveredQuestion = question.id)}
                 onmouseleave={() => (hoveredQuestion = null)}
                 onclick={() => (selectedQuestionId = question.id)}
@@ -434,10 +531,12 @@
                       {question.difficulty}
                     </span>
                     <span class="points-badge">{question.points} pts</span>
-                    {#if getQuestionStatus(question.id) === "PASSED"}
-                      <span class="status-badge completed">✓ Done</span>
+                    {#if getQuestionStatus(question.id) === "COMPLETED"}
+                      <span class="status-badge completed">✓ Submitted</span>
                     {:else if getQuestionStatus(question.id) === "FAILED"}
-                      <span class="status-badge failed">✗ Failed</span>
+                      <span class="status-badge failed">✗ Error</span>
+                    {:else if ["PENDING", "RUNNING"].includes(getQuestionStatus(question.id))}
+                      <span class="status-badge">⏳ Running</span>
                     {/if}
                   </div>
                 </div>
@@ -478,18 +577,17 @@
           <div class="editor-controls">
             <div class="language-selector">
               <label for="language-select">Language</label>
-              <select id="language-select" bind:value={language}>
-                <option value="javascript">JavaScript</option>
-                <option value="python">Python</option>
-                <option value="java">Java</option>
-                <option value="cpp">C++</option>
-                <option value="go">Go</option>
+              <select id="language-select" bind:value={language} disabled={isLocked}>
+                {#each languages as option (option.id)}
+                  <option value={option.id}>{option.label}</option>
+                {/each}
               </select>
             </div>
             <div class="editor-actions">
               <button
                 class="fullscreen-btn"
                 onclick={() => (isFullscreen = !isFullscreen)}
+                title="Toggle a larger editor"
               >
                 ⛶
               </button>
@@ -497,36 +595,60 @@
           </div>
 
           <div class="code-editor" class:fullscreen={isFullscreen}>
-            <div class="editor-line-numbers">
-              {#each Array(code.split("\n").length) as _, i}
-                <span>{i + 1}</span>
-              {/each}
-            </div>
-            <textarea
-              bind:value={code}
-              spellcheck="false"
-              class="code-input"
-              onkeydown={(e) => {
-                if (e.key === "Tab") {
-                  e.preventDefault();
-                  const start = e.currentTarget.selectionStart;
-                  const end = e.currentTarget.selectionEnd;
-                  code = code.substring(0, start) + "  " + code.substring(end);
-                  setTimeout(() => {
-                    e.currentTarget.selectionStart =
-                      e.currentTarget.selectionEnd = start + 2;
-                  }, 0);
-                }
-              }}
-            ></textarea>
+            <!-- Keyed so switching question or language builds a fresh editor
+                 rather than trying to reconcile an unrelated buffer. -->
+            {#key `${selectedQuestionId}-${language}`}
+              <MonacoEditor
+                value={code}
+                onChange={setCode}
+                language={currentLanguage?.editorLanguage ?? "javascript"}
+                readOnly={isLocked}
+                questionId={selectedQuestionId}
+              />
+            {/key}
           </div>
+
+          {#if runError}
+            <div class="run-panel run-panel-error" transition:slide={{ duration: 200 }}>
+              <p class="run-panel-title">Your code could not run</p>
+              <pre>{runError}</pre>
+            </div>
+          {:else if runResults.length}
+            <div class="run-panel" transition:slide={{ duration: 200 }}>
+              <p class="run-panel-title">
+                Sample test cases — {runResults.filter((r) => r.passed).length}/{runResults.length}
+                passed
+              </p>
+              <ul class="run-list">
+                {#each runResults as result, index (index)}
+                  <li class="run-item" class:failed={!result.passed}>
+                    <span class="run-verdict">{result.passed ? "✓" : "✗"}</span>
+                    <span class="run-detail">
+                      Test {index + 1}
+                      {#if result.error}
+                        — {result.error}
+                      {:else if !result.passed}
+                        — expected {preview(result.expected)}, got {preview(result.output)}
+                      {/if}
+                      {#if result.stdout}
+                        <span class="run-stdout">{result.stdout}</span>
+                      {/if}
+                    </span>
+                  </li>
+                {/each}
+              </ul>
+              <p class="run-note">
+                Hidden test cases are only checked when you submit.
+              </p>
+            </div>
+          {/if}
 
           <div class="action-bar">
             <div class="action-left">
               <button
                 class="action-btn run-btn"
                 onclick={runCode}
-                disabled={isRunning || isCompleted}
+                disabled={isRunning || isLocked}
                 transition:scale={{ duration: 150 }}
               >
                 <span class="btn-icon">▶</span>
@@ -537,7 +659,7 @@
               <button
                 class="action-btn submit-btn"
                 onclick={submitCode}
-                disabled={isSubmitting || isCompleted}
+                disabled={isSubmitting || isLocked}
                 transition:scale={{ duration: 150 }}
               >
                 <span class="btn-icon">📤</span>
@@ -698,6 +820,100 @@
     display: flex;
     gap: 16px;
     align-items: center;
+  }
+
+  .countdown {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+    color: #34d399;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+  }
+
+  .countdown.urgent {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #fbbf24;
+  }
+
+  .countdown.expired {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #f87171;
+  }
+
+  .countdown-value {
+    font-size: 1rem;
+    letter-spacing: 0.04em;
+  }
+
+  /* Results of a practice run against the visible test cases. */
+  .run-panel {
+    margin: 0 20px 12px;
+    padding: 14px 16px;
+    border-radius: 10px;
+    background: #111815;
+    border: 1px solid #1a2420;
+  }
+
+  .run-panel-error pre {
+    margin: 8px 0 0;
+    white-space: pre-wrap;
+    color: #f87171;
+    font-size: 0.8rem;
+  }
+
+  .run-panel-title {
+    margin: 0;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #e7f0ec;
+  }
+
+  .run-list {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+
+  .run-item {
+    display: flex;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: #9fb3ab;
+  }
+
+  .run-verdict {
+    color: #34d399;
+    font-weight: 700;
+  }
+
+  .run-item.failed .run-verdict {
+    color: #f87171;
+  }
+
+  .run-stdout {
+    display: block;
+    margin-top: 4px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: #0a0e0c;
+    color: #6b7f77;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .run-note {
+    margin: 10px 0 0;
+    font-size: 0.72rem;
+    color: #6b7f77;
   }
 
   .finish-btn {
@@ -1089,35 +1305,8 @@
     border-radius: 0;
   }
 
-  .editor-line-numbers {
-    padding: 16px 12px;
-    background: #0a0e0c;
-    color: #5f6b66;
-    font-family: "Courier New", monospace;
-    font-size: 0.85rem;
-    line-height: 1.6;
-    text-align: right;
-    user-select: none;
-    min-width: 40px;
-  }
 
-  .code-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    padding: 16px;
-    color: #e7f0ec;
-    font-family: "Courier New", monospace;
-    font-size: 0.85rem;
-    line-height: 1.6;
-    resize: vertical;
-    outline: none;
-    tab-size: 2;
-  }
 
-  .code-input::selection {
-    background: rgba(16, 185, 129, 0.2);
-  }
 
   .action-bar {
     padding: 16px 24px;

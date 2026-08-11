@@ -1,0 +1,9 @@
+<script lang="ts">
+  import type { Submission } from "./types";
+  let { submissions, onView, currentPage = $bindable(1), itemsPerPage = $bindable(10) }: { submissions: Submission[]; onView: (submission: Submission) => void; currentPage?: number; itemsPerPage?: number } = $props();
+  const pageCount = $derived(Math.max(1, Math.ceil(submissions.length / itemsPerPage)));
+  const visible = $derived(submissions.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage));
+  const score = (submission: Submission) => `${submission.passed ?? 0}/${(submission.passed ?? 0) + (submission.failed ?? 0)}`;
+</script>
+<div class="rounded-lg border overflow-x-auto"><table class="w-full text-sm"><thead class="bg-muted/50"><tr><th class="text-left p-3">Candidate</th><th class="text-left p-3">Question</th><th class="text-left p-3">Status</th><th class="text-left p-3">Score</th><th class="text-left p-3">Submitted</th><th class="p-3"></th></tr></thead><tbody>{#each visible as submission (submission.id)}<tr class="border-t"><td class="p-3">{submission.candidate?.email ?? "Candidate"}</td><td class="p-3">{submission.question?.title ?? "Question"}</td><td class="p-3">{submission.status}</td><td class="p-3">{score(submission)}</td><td class="p-3">{new Date(submission.createdAt).toLocaleString()}</td><td class="p-3"><button class="underline" onclick={() => onView(submission)}>View</button></td></tr>{/each}</tbody></table></div>
+<div class="flex items-center justify-between mt-3 text-sm"><label>Rows <select bind:value={itemsPerPage}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option></select></label><div><button disabled={currentPage <= 1} onclick={() => currentPage -= 1}>Previous</button><span class="mx-3">{currentPage} / {pageCount}</span><button disabled={currentPage >= pageCount} onclick={() => currentPage += 1}>Next</button></div></div>

@@ -1,49 +1,61 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import * as monaco from "monaco-editor";
   import { socketStore } from "$stores/socketStore";
   import { candidateStore } from "$stores/candidateStore";
 
+  // `value` is a one-way prop with an onChange callback rather than a binding,
+  // because the page derives it from a per-question/per-language map.
   let {
-    code = "",
+    value = "",
+    onChange,
     language = "javascript",
     readOnly = false,
     questionId = "",
-  } = $props<{
-    code?: string;
+  }: {
+    value?: string;
+    onChange: (next: string) => void;
     language?: string;
     readOnly?: boolean;
     questionId?: string;
-  }>();
+  } = $props();
 
-  let editorContainer!: HTMLDivElement;
-  let editor: monaco.editor.IStandaloneCodeEditor | null = null;
+  let editorContainer: HTMLDivElement;
+  // Typed loosely because monaco is only imported in the browser, below.
+  let editor: any = null;
+  let monaco: any = null;
+  let ready = $state(false);
 
+  // Guards the feedback loop: writing a new value into the editor fires
+  // onDidChangeModelContent, which would otherwise write straight back out.
+  let applyingExternalValue = false;
   let debounceTimer: ReturnType<typeof setTimeout>;
-
-  let domNode: HTMLElement | null = null;
   let copyHandler: (() => void) | null = null;
+  let domNode: HTMLElement | null = null;
 
-  onMount(() => {
-    // Configure Monaco
-    monaco.editor.defineTheme("dark-theme", {
+  onMount(async () => {
+    // Monaco touches `window` and `document` at import time, so it can only be
+    // loaded once we're actually in the browser — never during SSR.
+    monaco = await import("monaco-editor");
+    const editorWorker = (
+      await import("monaco-editor/esm/vs/editor/editor.worker?worker")
+    ).default;
+    (self as any).MonacoEnvironment = { getWorker: () => new editorWorker() };
+
+    monaco.editor.defineTheme("codebench-dark", {
       base: "vs-dark",
       inherit: true,
       rules: [],
       colors: {
-        "editor.background": "#1e1e1e",
-        "editor.foreground": "#d4d4d4",
-        "editorLineNumber.foreground": "#858585",
-        "editor.selectionBackground": "#264f78",
-        "editor.inactiveSelectionBackground": "#3a3d41",
+        "editor.background": "#0f1613",
+        "editor.foreground": "#e7f0ec",
+        "editorLineNumber.foreground": "#4a5a53",
       },
     });
 
-    // Create editor
     editor = monaco.editor.create(editorContainer, {
-      value: code,
+      value,
       language,
-      theme: "dark-theme",
+      theme: "codebench-dark",
       automaticLayout: true,
       readOnly,
       minimap: { enabled: false },
@@ -51,143 +63,93 @@
       lineNumbers: "on",
       scrollBeyondLastLine: false,
       tabSize: 2,
-      detectIndentation: true,
+      renderLineHighlight: "line",
     });
+    ready = true;
 
-    // Track code changes
     editor.onDidChangeModelContent(() => {
+      if (applyingExternalValue) return;
+      const next = editor.getValue();
+      onChange(next);
+
       clearTimeout(debounceTimer);
-
       debounceTimer = setTimeout(() => {
-        const newCode = editor?.getValue() ?? "";
-
-        code = newCode;
-        candidateStore.updateCode(questionId, newCode);
-
+        candidateStore.updateCode(questionId, next);
         if ($socketStore.isConnected) {
-          socketStore.emit("candidate:typing", {
-            questionId,
-            timestamp: Date.now(),
-          });
-
-          // Optional: send current code to recruiters
-          socketStore.emit("candidate:codeChange", {
-            questionId,
-            code: newCode,
-          });
+          socketStore.emit("candidate:typing", { questionId });
+          socketStore.emit("candidate:codeChange", { questionId, code: next });
         }
       }, 500);
     });
 
-    // Track cursor movement
-    editor.onDidChangeCursorPosition(
-      (e: monaco.editor.ICursorPositionChangedEvent) => {
-        if ($socketStore.isConnected) {
-          socketStore.emit("candidate:event", {
-            eventType: "CURSOR_MOVE",
-            metadata: {
-              position: e.position,
-              questionId,
-            },
-          });
-        }
-      },
-    );
+    // Paste and copy inside the editor are reported for the live monitor. The
+    // page-level listeners don't see these, since Monaco handles them itself.
+    editor.onDidPaste(() => socketStore.emit("candidate:event", { type: "paste" }));
 
-    // Track paste
-    editor.onDidPaste(() => {
-      if ($socketStore.isConnected) {
-        socketStore.emit("candidate:event", {
-          eventType: "PASTE",
-          metadata: {
-            questionId,
-            timestamp: Date.now(),
-          },
-        });
-      }
-    });
-
-    // Track copy
     domNode = editor.getDomNode();
-
     if (domNode) {
-      copyHandler = () => {
-        if ($socketStore.isConnected) {
-          socketStore.emit("candidate:event", {
-            eventType: "COPY",
-            metadata: {
-              questionId,
-              timestamp: Date.now(),
-            },
-          });
-        }
-      };
-
+      copyHandler = () => socketStore.emit("candidate:event", { type: "copy" });
       domNode.addEventListener("copy", copyHandler);
     }
   });
 
+  // Switching question or language replaces the buffer from the outside.
+  $effect(() => {
+    if (!ready || !editor) return;
+    if (value === editor.getValue()) return;
+
+    applyingExternalValue = true;
+    editor.setValue(value);
+    applyingExternalValue = false;
+  });
+
+  $effect(() => {
+    if (!ready || !editor || !monaco) return;
+    const model = editor.getModel();
+    if (model) monaco.editor.setModelLanguage(model, language);
+  });
+
+  $effect(() => {
+    if (ready && editor) editor.updateOptions({ readOnly });
+  });
+
   onDestroy(() => {
     clearTimeout(debounceTimer);
-
-    if (domNode && copyHandler) {
-      domNode.removeEventListener("copy", copyHandler);
-    }
-
+    if (domNode && copyHandler) domNode.removeEventListener("copy", copyHandler);
     editor?.dispose();
   });
 </script>
 
 <div class="editor-wrapper">
-  <div class="editor-header">
-    <span class="language-badge">{language}</span>
-    <span class="editor-status">
-      {#if readOnly}
-        <span class="badge badge-secondary">Read Only</span>
-      {/if}
-    </span>
-  </div>
   <div bind:this={editorContainer} class="editor-container"></div>
+  {#if !ready}
+    <p class="editor-loading">Loading editor…</p>
+  {/if}
 </div>
 
 <style>
   .editor-wrapper {
+    position: relative;
     height: 100%;
-    display: flex;
-    flex-direction: column;
-    background: #1e1e1e;
+    min-height: 420px;
+    background: #0f1613;
     border-radius: 8px;
     overflow: hidden;
   }
 
-  .editor-header {
-    padding: 8px 16px;
-    background: #252526;
-    border-bottom: 1px solid #3e3e42;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
   .editor-container {
-    flex: 1;
-    min-height: 400px;
+    height: 100%;
+    min-height: 420px;
   }
 
-  .language-badge {
-    background: #2d2d2d;
-    color: #d4d4d4;
-    padding: 2px 12px;
-    border-radius: 12px;
-    font-size: 12px;
-    text-transform: uppercase;
-  }
-
-  .badge-secondary {
-    background: #3e3e42;
-    color: #d4d4d4;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+  .editor-loading {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    margin: 0;
+    color: #6b7f77;
+    font-size: 0.85rem;
+    background: #0f1613;
   }
 </style>

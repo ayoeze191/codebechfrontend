@@ -1,16 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { goto } from "$app/navigation";
   import { api } from "$lib/api";
   import { socketStore } from "$stores/socketStore";
-  import { Button } from "$lib/components/ui/button";
   import * as Card from "$lib/components/ui/card";
-
-  // TODO: adjust this import to however your app exposes the current
-  // recruiter's JWT client-side (the socket handshake needs it — this is
-  // separate from whatever your `api` HTTP client uses internally).
-  //   import { getAuthToken } from "$lib/auth";
 
   type Progress = "not_started" | "in_progress" | "completed" | "expired";
 
@@ -31,11 +24,7 @@
     timestamp: string;
   };
 
-  // NOTE: verify this matches your route folder param name.
-  let assessmentId = $state("");
-  $effect(() => {
-    assessmentId = page.params!.id!;
-  });
+  const assessmentId = $derived(page.params._assessmentId!);
 
   let candidates = $state<CandidateRow[]>([]);
   let loading = $state(true);
@@ -174,20 +163,12 @@
       invitationId
     );
   }
-
-  function goBack() {
-    goto(`/recruiter/assessments/${assessmentId}/results`);
-  }
 </script>
 
-<main class="min-h-screen p-6 bg-gradient-to-br from-slate-50 to-slate-100/80">
-  <div class="flex items-center justify-between mb-6">
-    <button
-      class="text-sm text-slate-500 hover:text-slate-900 flex items-center gap-1"
-      onclick={goBack}
-    >
-      ← Back to results
-    </button>
+<svelte:head><title>Live monitor · CodeBench</title></svelte:head>
+
+<div>
+  <div class="flex items-center justify-end mb-6">
     <div
       class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold {isLive
         ? 'bg-green-100 text-green-700 border border-green-200'
@@ -359,4 +340,4 @@
       </Card.Content>
     </Card.Root>
   {/if}
-</main>
+</div>
